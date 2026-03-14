@@ -1,0 +1,5 @@
+{
+  "name": "JurisLens - AI Legal Summarizer",
+  "description": "An open-source legal research tool for Indian and International case laws. Features intelligent citation search, ratio decidendi extraction, and structured headnote generation using Gemini AI.",
+  "requestFramePermissions": []
+}
