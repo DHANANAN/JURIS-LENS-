@@ -1,7 +1,31 @@
 export enum SearchMode {
   CITATION = 'CITATION',
   CASE_NAME = 'CASE_NAME',
-  TEXT_ANALYSIS = 'TEXT_ANALYSIS'
+  TEXT_ANALYSIS = 'TEXT_ANALYSIS',
+  ADVANCED = 'ADVANCED'
+}
+
+export enum CaseType {
+  CIVIL = 'CIVIL',
+  CRIMINAL = 'CRIMINAL',
+  CONSTITUTIONAL = 'CONSTITUTIONAL',
+  COMMERCIAL = 'COMMERCIAL',
+  FAMILY = 'FAMILY',
+  ALL = 'ALL'
+}
+
+export enum RelevanceSort {
+  RELEVANCE = 'RELEVANCE',
+  NEWEST = 'NEWEST',
+  OLDEST = 'OLDEST',
+  MOST_CITED = 'MOST_CITED'
+}
+
+export interface SearchFilters {
+  caseType: CaseType;
+  yearStart?: number;
+  yearEnd?: number;
+  relevance: RelevanceSort;
 }
 
 export enum Jurisdiction {
@@ -61,7 +85,7 @@ export interface CitationStats {
 }
 
 export interface CaseSource {
-  type: 'OFFICIAL PDF' | 'LEGAL DB' | 'NEWS/MEDIA';
+  type: 'OFFICIAL PDF' | 'LEGAL DB' | 'NEWS/MEDIA' | 'DIRECT PDF DOWNLOAD';
   name: string;
   url: string;
 }
@@ -76,7 +100,7 @@ export interface CaseSummary {
   jurisdiction: string;
   
   // Structured Headnote
-  facts: string;
+  factsAndNarrative: string; // Combined: Detailed facts and narrative story
   timeline: TimelineEvent[]; 
   proceduralHistory?: string[]; // New: For Flowchart (e.g., Trial Court -> High Court)
   issues: string[];
@@ -96,6 +120,9 @@ export interface CaseSummary {
 
   // The Street-Smart "Vakil Mode" Analysis
   vakilTake?: string; 
+  
+  // AI Transparency
+  reasoningNote?: string; 
   
   significance: string; // Impact on law
   lawsInvolved: string[]; // Acts/Sections

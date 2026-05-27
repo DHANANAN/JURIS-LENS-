@@ -1,9 +1,31 @@
-import { GoogleGenAI, Type, Schema } from "@google/genai";
-import { CaseSummary, CaseSearchResult, Jurisdiction } from "../types";
+import { GoogleGenAI, Type, Schema, ThinkingLevel } from "@google/genai";
+import { CaseSummary, CaseSearchResult, Jurisdiction, SearchFilters, CaseType, RelevanceSort } from "../types";
 
-const apiKey = process.env.API_KEY;
+const apiKey = process.env.GEMINI_API_KEY;
+
+const checkApiKey = () => {
+  if (!apiKey || apiKey.trim() === "") {
+    throw new Error("API_KEY_MISSING");
+  }
+};
+
 const ai = new GoogleGenAI({ apiKey: apiKey || "" });
 const modelId = "gemini-3-flash-preview"; 
+
+// Retry logic wrapper with exponential backoff
+const withRetry = async <T>(fn: () => Promise<T>, retries = 3): Promise<T> => {
+  try {
+    return await fn();
+  } catch (error) {
+    if (retries > 0) {
+      const waitTime = Math.pow(2, 3 - retries) * 1000;
+      console.warn(`Retrying in ${waitTime}ms... attempts left: ${retries}`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return withRetry(fn, retries - 1);
+    }
+    throw error;
+  }
+};
 
 // Schema definition for the structured legal output
 const caseSummarySchema: Schema = {
@@ -20,7 +42,7 @@ const caseSummarySchema: Schema = {
       description: "List of judges on the bench"
     },
     jurisdiction: { type: Type.STRING },
-    facts: { type: Type.STRING, description: "Extensive and detailed narrative of the material facts. Target 500+ words." },
+    factsAndNarrative: { type: Type.STRING, description: "A comprehensive, all-covering section that integrates material facts with a natural narrative story. Target 600-800 words." },
     timeline: {
       type: Type.ARRAY,
       items: {
@@ -87,7 +109,11 @@ const caseSummarySchema: Schema = {
     },
     vakilTake: {
       type: Type.STRING,
-      description: "A street-smart, practical analysis."
+      description: "A street-smart, practical analysis. Target 600-800 words."
+    },
+    reasoningNote: {
+      type: Type.STRING,
+      description: "Explain the AI reasoning process: how names were detected, how cases were matched, and how the summary was generated in plain language."
     },
     issues: { 
       type: Type.ARRAY, 
@@ -135,15 +161,15 @@ const caseSummarySchema: Schema = {
       items: {
         type: Type.OBJECT,
         properties: {
-          type: { type: Type.STRING, enum: ['OFFICIAL PDF', 'LEGAL DB', 'NEWS/MEDIA'] },
-          name: { type: Type.STRING, description: "Name of source (e.g. 'Supreme Court of India', 'LiveLaw')" },
+          type: { type: Type.STRING, enum: ['OFFICIAL PDF', 'LEGAL DB', 'NEWS/MEDIA', 'DIRECT PDF DOWNLOAD'] },
+          name: { type: Type.STRING, description: "Name of source (e.g. 'Supreme Court of India', 'LiveLaw', 'Direct PDF Download')" },
           url: { type: Type.STRING, description: "Valid URL" }
         }
       },
-      description: "Provide at least 9 distinct links: Official Repositories, Legal DBs, and Media Analysis."
+      description: "Provide at least 9 distinct links: Official Repositories, Legal DBs, Media Analysis, and at least 2 DIRECT PDF DOWNLOAD links."
     }
   },
-  required: ["caseName", "citation", "court", "year", "facts", "irac", "stats", "issues", "decision", "ratioDecidendi", "significance", "subsequentDevelopments", "sources", "proceduralHistory", "petitionerArguments", "respondentArguments"]
+  required: ["caseName", "citation", "court", "year", "factsAndNarrative", "irac", "stats", "issues", "decision", "ratioDecidendi", "significance", "subsequentDevelopments", "sources", "proceduralHistory", "petitionerArguments", "respondentArguments"]
 };
 
 const searchResultSchema: Schema = {
@@ -153,18 +179,17 @@ const searchResultSchema: Schema = {
     properties: {
       caseName: { type: Type.STRING },
       citation: { type: Type.STRING },
-      context: { type: Type.STRING, description: "Why this case matches the query" },
-      pdfUrl: { type: Type.STRING, description: "Primary direct URL to PDF if available" },
+      context: { type: Type.STRING, description: "Brief context" },
+      pdfUrl: { type: Type.STRING, description: "PDF link" },
       sourceUrls: { 
         type: Type.ARRAY, 
         items: {
           type: Type.OBJECT,
           properties: {
-            source: { type: Type.STRING, description: "Source Name (e.g., Supreme Court, Indian Kanoon)" },
-            url: { type: Type.STRING, description: "The direct link" }
+            source: { type: Type.STRING },
+            url: { type: Type.STRING }
           }
-        },
-        description: "List of multiple sources found via Google Search"
+        }
       }
     },
     required: ["caseName", "citation", "context"]
@@ -173,33 +198,39 @@ const searchResultSchema: Schema = {
 
 export const searchCaseDatabase = async (
   query: string,
-  jurisdiction: Jurisdiction
+  jurisdiction: Jurisdiction,
+  filters?: SearchFilters
 ): Promise<CaseSearchResult[]> => {
-  try {
-    if (!apiKey) throw new Error("API Key not found");
+  return withRetry(async () => {
+    checkApiKey();
+
+    const filterContext = filters ? `
+      FILTERS:
+      - Case Type: ${filters.caseType}
+      - Year Range: ${filters.yearStart || 'Any'} to ${filters.yearEnd || 'Any'}
+      - Sort By: ${filters.relevance}
+    ` : '';
 
     const prompt = `
-      You are an elite Legal Search Engine powered by Gemini.
+      You are an elite Legal Search Engine powered by Gemini. 
+      Your mission is to find high-authority, verifiable legal documents.
+
       User Query: "${query}"
       Jurisdiction: ${jurisdiction}
+      ${filterContext}
       
-      SEARCH INSTRUCTIONS:
-      1. **BOOLEAN LOGIC**: Strictly interpret 'AND', 'OR', 'NOT'.
-      2. **ISSUE SEARCH**: Identify landmark cases for issue-based queries.
+      CRITICAL SEARCH INSTRUCTIONS:
+      1. **ENTITY DETECTION**: Automatically detect parties, judges, and specific statutes. 
+         - If query is a citation (e.g., '2014 4 SC 1'), prioritize finding the exact case.
+         - If query is a topic (e.g., 'Right to Privacy'), find LANDMARK cases first.
+      2. **LINK STABILITY (THE GOLDEN RULE)**: 
+         - ALWAYS provide a direct Google Search link formatted exactly as: 'https://www.google.com/search?q=[FULL_CASE_NAME]+[SITE_NAME]'
+         - Prioritize official court websites (.gov.in, .gov.uk, etc.), Indian Kanoon, and major legal journals (LiveLaw, Bar & Bench).
+      3. **PDF EXTRACTION**: 
+         - Attempt to find a Direct PDF Download search string: 'https://www.google.com/search?q=[FULL_CASE_NAME]+filetype:pdf'
+      4. **CONTEXT**: In the 'context' field, explain the relevance to the user's specific query. Use professional legal terminology.
 
-      GROUNDING & PDF RETRIEVAL (CRITICAL):
-      You MUST search specifically within these repositories for DIRECT PDF/HTML links:
-      
-      INDIA:
-      - Supreme Court: main.sci.gov.in (Prioritize)
-      - Indian Kanoon: indiankanoon.org
-      - eCourts: ecourts.gov.in
-      - High Courts: delhihighcourt.nic.in, bombayhighcourt.nic.in, etc.
-      
-      GLOBAL:
-      - CourtListener, BAILII, AustLII, CanLII, HUDOC.
-
-      Return a JSON array of the top 4 most relevant cases.
+      Return a JSON array of the top 5 most relevant results.
     `;
 
     const response = await ai.models.generateContent({
@@ -209,7 +240,7 @@ export const searchCaseDatabase = async (
         tools: [{ googleSearch: {} }],
         responseMimeType: "application/json",
         responseSchema: searchResultSchema,
-        temperature: 0.1, 
+        temperature: 0, 
       }
     });
 
@@ -221,10 +252,7 @@ export const searchCaseDatabase = async (
     }
 
     return JSON.parse(text) as CaseSearchResult[];
-  } catch (error) {
-    console.error("Search Error:", error);
-    throw error;
-  }
+  });
 };
 
 export const fetchCaseSummary = async (
@@ -233,20 +261,25 @@ export const fetchCaseSummary = async (
   isVakilMode: boolean = false,
   isRawText: boolean = false
 ): Promise<CaseSummary> => {
-  try {
-    if (!apiKey) throw new Error("API Key not found");
+  return withRetry(async () => {
+    checkApiKey();
 
     let prompt = "";
     
     const persona = isVakilMode 
-      ? `You are a legendary Senior Advocate. Provide EXHAUSTIVE, STRATEGIC, and DETAILED analysis (3000 words equivalent).
-         TONE: Authoritative, cynical, bold.
+      ? `You are a legendary Senior Advocate. Provide a STRATEGIC, AUTHORITATIVE, and DETAILED analysis (800+ words for the 'vakilTake' section).
+         TONE: Cynical yet deeply insightful, street-smart, and strategic.
          
-         KEY REQUIREMENTS:
-         - 'stats': You MUST estimate the impact score (0-100) and citation sentiment.
-         - 'facts': Long narrative (600+ words).
-         - 'irac': Deep breakdown.`
-      : `You are an expert Legal Researcher. Provide a comprehensive summary (1000 words).`;
+         KEY REQUIREMENTS FOR 'vakilTake':
+         - **Strategic Posturing**: How would you argue this today?
+         - **Hidden Precedents**: Mention lesser-known cases that influence this.
+         - **Litigation Risks**: What are the dangers of relying on this case?
+         - **Modern Context**: How does this play in today's courts?
+         
+         OTHER REQUIREMENTS:
+         - 'stats': Accurate impact score and sentiment analytics.
+         - 'factsAndNarrative': A compelling, detailed story of the case (600+ words).`
+      : `You are an expert Legal Researcher. Provide a definitive, scholarly summary (600+ words).`;
 
     if (isRawText) {
       prompt = `
@@ -266,30 +299,26 @@ export const fetchCaseSummary = async (
         
         Provide the output in the defined JSON schema.
         
-        SEARCH REQUIREMENT:
-        You MUST find **9 DISTINCT LINKS** for the 'sources' array.
-        Scan Official, Legal DBs, and reputable Media.
-        
-        1. **OFFICIAL REPOSITORIES (3)**: 
-           - 'sci.gov.in', 'ecourts.gov.in', High Court websites.
-           - International: 'govinfo.gov', 'curia.europa.eu'.
-           
-        2. **LEGAL DATABASES (3)**: 
-           - 'indiankanoon.org', 'casemine.com', 'manupatra.com', 'legalcrystal.com'.
-           - 'courtlistener.com', 'canlii.org', 'bailii.org'.
-           
-        3. **MEDIA & ANALYSIS (3)**: 
-           - 'livelaw.in', 'barandbench.com', 'scconline.com', 'thehindu.com', 'bloombergquint.com'.
-           
-        EXTRACTION REQUIREMENT:
-        - **Procedural History**: Extract the path from lower courts to the final court as a list of strings (e.g. "Trial Court convicted", "High Court acquitted").
-        - **Arguments**: Clearly separate Petitioner vs Respondent arguments.
-        - **Judges**: List all judges on the bench.
+        CONTENT EXPANSION:
+        - **Facts & Narrative**: A comprehensive, all-covering section that integrates material facts with a natural narrative story. Ensure it is detailed and authoritative.
+        - **Issues Framed**: Clear legal questions at hand.
+        - **Holdings and Reasoning**: The 'why' behind the decision, covering all facets.
+        - **Citations**: Use Bluebook/OSCOLA/local style. Include parallel citations where relevant.
+        - **AI Reasoning Note**: Explain how you detected names, matched cases, and generated this summary.
+
+        SEARCH & LINK PROTOCOL:
+        1. **STRATEGY**: Strictly provide **GOOGLE SEARCH URLs** for all sources to ensure stability.
+        2. **9 SEARCH LINKS**: Provide exactly 9 links in 'sources'.
+        3. **LINK STABILITY**: Use Google Search links for Indian Kanoon, Official Court websites (e.g. sci.gov.in, hc.gov.in), and direct PDF downloads.
+        4. **CRITICAL OFFICIAL SOURCE OPTIMIZATION**: The user needs immediate access to the direct official PDF of the case. In India, official pages are often hard to find because secondary citation blogs dominate.
+           - The VERY FIRST source in the 'sources' array MUST be of type 'OFFICIAL PDF' or 'DIRECT PDF DOWNLOAD' and link to the primary official judgement text.
+           - This first link's URL MUST be constructed using high-precision Google Search parameters to screen out secondary legal articles/citations.
+           - Use this precise query URL format for the first listing:
+             https://www.google.com/search?q=site:gov.in+OR+site:nic.in+OR+site:indiankanoon.org+"[CASE_NAME]"+judgment+filetype:pdf+-"judgment+relying+upon"+-"judgement+relying+upon"+-"cases+relying+on"+-"cited+in"+-"referring+to"+-"referred+in"
+             (Replace [CASE_NAME] with the actual full name of the case with spaces encoded as '+').
         
         ANALYTICS:
-        - Populate 'citationTrend' (Decadal).
-        - Populate 'benchSplit' (Majority/Dissent).
-        - Populate 'legalConcepts' (Doctrines).
+        - Accurate 'citationTrend' and 'benchSplit' data.
       `;
     }
 
@@ -300,7 +329,7 @@ export const fetchCaseSummary = async (
         tools: [{ googleSearch: {} }], 
         responseMimeType: "application/json",
         responseSchema: caseSummarySchema,
-        temperature: 0.2, 
+        temperature: 0,
       }
     });
 
@@ -312,9 +341,5 @@ export const fetchCaseSummary = async (
     }
 
     return JSON.parse(text) as CaseSummary;
-
-  } catch (error) {
-    console.error("Gemini Legal Search Error:", error);
-    throw error;
-  }
+  });
 };
